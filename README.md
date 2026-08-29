@@ -42,7 +42,7 @@ A comprehensive AI-powered resume management platform built with React.js and Fa
 - **Motor** - Async MongoDB driver
 
 ### AI/ML Components
-- **sentence-transformers/all-MiniLM-L6-v2** - Semantic similarity calculation
+- **BAAI/bge-base-en-v1.5** - Semantic similarity calculation
 - **OpenAI GPT-3.5-turbo** - Text enhancement and conversation
 - **Scikit-learn** - Cosine similarity calculations
 - **PyTorch** - Machine learning framework

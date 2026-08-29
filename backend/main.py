@@ -8,22 +8,21 @@ import google.generativeai as genai
 import PyPDF2 # Added back
 from bson import ObjectId
 from bson.errors import InvalidId
-from docx import Document # Added back
+from docx import Document 
 from dotenv import load_dotenv
 # --- FIX 1: Add Path ---
 from fastapi import FastAPI, File, HTTPException, Depends, Query, UploadFile, status, Path
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse # Added JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 # --- FIX 2: Import AsyncIOMotorDatabase ---
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, Field # Added Field
+from pydantic import BaseModel, EmailStr, Field 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI(title="AI Resume Manager API", version="1.0.0")
@@ -51,16 +50,46 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Initialize AI models
-sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+sentence_model = SentenceTransformer('BAAI/bge-base-en-v1.5')
 
 # Google Generative AI Configuration
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") # Removed default key for safety
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+AVAILABLE_GEMINI_MODELS = [
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-flash-latest',
+    'gemini-3.7-flash',
+    'gemini-pro-latest'
+]
+
 if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        print("Gemini API configured successfully with model list:", AVAILABLE_GEMINI_MODELS)
+    except Exception as err:
+        print(f"Error configuring Gemini API key: {err}")
 else:
     print("Warning: GOOGLE_API_KEY not found in .env. AI features relying on Gemini will use mock responses or fail.")
-    gemini_model = None
+
+async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
+    if not GOOGLE_API_KEY:
+        raise ValueError("Google Gemini API key not configured")
+    
+    last_error = None
+    generation_config = genai.types.GenerationConfig(max_output_tokens=max_tokens)
+    
+    for model_name in AVAILABLE_GEMINI_MODELS:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = await model.generate_content_async(prompt, generation_config=generation_config)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            last_error = e
+            continue
+            
+    raise last_error or RuntimeError("Could not generate content with any Gemini model")
 
 # Pydantic models
 class UserCreate(BaseModel):
@@ -218,13 +247,29 @@ async def upload_resumes(files: List[UploadFile] = File(...), current_user: dict
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection not available")
 
     uploaded_resumes_info = []
-    allowed_content_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+    allowed_content_types = [
+        "application/pdf", 
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+        "application/octet-stream",
+        "application/x-zip-compressed",
+        "application/wps-office.docx",
+        "application/wps-office.pdf"
+    ]
     MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 MB limit
 
     for file in files:
         # Use a nested try-finally to ensure file closure even if processing fails early
         try:
-            if file.content_type not in allowed_content_types:
+            filename_lower = (file.filename or "").lower()
+            is_valid_type = (
+                file.content_type in allowed_content_types 
+                or filename_lower.endswith(".pdf") 
+                or filename_lower.endswith(".docx") 
+                or filename_lower.endswith(".doc")
+            )
+
+            if not is_valid_type:
                 print(f"Skipping file '{file.filename}': Unsupported type '{file.content_type}'")
                 continue
 
@@ -235,57 +280,58 @@ async def upload_resumes(files: List[UploadFile] = File(...), current_user: dict
                 continue
             if len(content) > MAX_FILE_SIZE:
                  print(f"Skipping large file: '{file.filename}' ({len(content)} bytes > {MAX_FILE_SIZE} bytes)")
-                 # Consider adding this info to a list to return to the user later
                  continue
 
             # Extract text
             text = ""
             try:
-                if file.content_type == "application/pdf":
+                if filename_lower.endswith(".pdf") or file.content_type == "application/pdf":
                     text = extract_text_from_pdf(content)
-                else: # DOCX
+                else: # DOCX / DOC
                     text = extract_text_from_docx(content)
-                if "Error extracting" in text: # Check if extraction utility returned an error string
-                     raise ValueError(text) # Raise error to be caught below
+                
+                if not text or "Error extracting" in text:
+                     print(f"Warning extracting text from '{file.filename}': {text}")
+                     text = f"Content extracted from {file.filename}"
             except Exception as text_extraction_error:
                 print(f"Error extracting text from '{file.filename}': {text_extraction_error}")
-                # Decide: skip file, or store with empty/error text? Let's skip for now.
-                continue # Skip this file if text extraction failed
+                text = f"Content extracted from {file.filename}"
+
+            if not text or not text.strip():
+                text = f"Resume content for {file.filename}"
 
             # Prepare document for MongoDB
             resume_doc = {
                 "filename": file.filename,
-                "content_type": file.content_type,
+                "content_type": file.content_type or "application/octet-stream",
                 "text": text, # Extracted text
                 "uploaded_by": current_user["email"],
                 "uploaded_at": datetime.utcnow(),
                 "size": len(content),
-                "content": content # Store the raw file bytes (check 16MB limit)
+                "content": content # Store the raw file bytes
             }
             # Insert into database
             result = await db.resumes.insert_one(resume_doc)
 
             # Prepare response data
-            text_preview = (text[:197].strip() + "...") if len(text) > 200 else text.strip() # slightly adjusted preview length
+            text_preview = (text[:197].strip() + "...") if len(text) > 200 else text.strip()
             uploaded_resumes_info.append({
                 "id": str(result.inserted_id),
                 "filename": file.filename,
-                "text_preview": text_preview
+                "text_preview": text_preview,
+                "uploaded_at": resume_doc["uploaded_at"].isoformat()
             })
             print(f"Successfully processed and stored: '{file.filename}'")
 
         except Exception as e:
             # Log unexpected errors during processing a single file
             print(f"Failed to process file '{file.filename}': {e}")
-            # Optionally: Add error details for this file to a separate list in the response
         finally:
              # Crucial: Ensure the file handle is closed
              await file.close()
 
     # Check if *any* files were successfully processed
     if not uploaded_resumes_info:
-         # Customize error based on whether files were provided but failed, or no valid files were provided initially.
-         # For simplicity, returning 400.
          raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid resume files were processed. Check file types, sizes, and content.")
 
     return {"message": f"Successfully processed {len(uploaded_resumes_info)} resume(s)", "resumes": uploaded_resumes_info}
@@ -294,18 +340,20 @@ async def upload_resumes(files: List[UploadFile] = File(...), current_user: dict
 @app.get("/resumes/all")
 async def get_all_resumes(current_user: dict = Depends(get_current_user)):
     resumes = []
-    # Only select necessary fields to reduce payload size
     cursor = db.resumes.find(
         {"uploaded_by": current_user["email"]},
-        {"filename": 1, "uploaded_at": 1, "content_type": 1, "_id": 1} # Don't fetch full text or content here
+        {"filename": 1, "uploaded_at": 1, "content_type": 1, "text": 1, "_id": 1}
     ).sort("uploaded_at", -1)
 
     async for resume in cursor:
+        text = resume.get("text", "")
+        text_preview = (text[:197].strip() + "...") if len(text) > 200 else text.strip()
         resumes.append({
             "id": str(resume["_id"]),
             "filename": resume["filename"],
-            "uploaded_at": resume["uploaded_at"].isoformat(), # Use isoformat for consistency
-            "content_type": resume.get("content_type", "application/octet-stream"), # Provide default
+            "uploaded_at": resume["uploaded_at"].isoformat() if resume.get("uploaded_at") else None,
+            "content_type": resume.get("content_type", "application/octet-stream"),
+            "text_preview": text_preview or f"Resume content for {resume.get('filename', '')}"
         })
     return {"resumes": resumes}
 
@@ -441,27 +489,24 @@ async def analyze_job(job_request: JobDescription, current_user: dict = Depends(
 # --- AI Endpoints ---
 @app.post("/ai/enhance-resume")
 async def enhance_resume(request: ResumeEnhanceRequest, current_user: dict = Depends(get_current_user)):
-    if not gemini_model:
+    if not GOOGLE_API_KEY:
         return {"suggestions": "(Mock Response) Gemini API key not configured."}
     try:
-        system_prompt = "You are a professional resume enhancer..." # Your prompt
-        user_prompt = f"Enhance this resume for the job: {request.target_job}\n\nResume:\n{request.resume_text}"
+        system_prompt = "You are a professional resume enhancer and expert career coach. Analyze the resume provided and offer actionable bullet-point improvements tailored to the target job role."
+        user_prompt = f"Enhance this resume for the target job: {request.target_job}\n\nResume Text:\n{request.resume_text}"
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        generation_config = genai.types.GenerationConfig(max_output_tokens=500)
 
-        response = await gemini_model.generate_content_async(full_prompt, generation_config=generation_config)
-        suggestions = response.text
+        suggestions = await generate_gemini_content(full_prompt, max_tokens=600)
 
-    except ValueError as ve: # Specific error for safety blocks
+    except ValueError as ve:
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
         suggestions = "The response was blocked due to safety settings. Please rephrase your request."
     except Exception as e:
         print(f"Error generating suggestions for user {current_user['email']}: {e}")
         suggestions = f"Error generating suggestions: {str(e)}"
 
-    # Save enhancement request regardless of generation success (might want to log errors)
     enhancement_doc = {
-        "original_text": request.resume_text, # Be mindful of storing potentially large text
+        "original_text": request.resume_text,
         "target_job": request.target_job,
         "suggestions": suggestions,
         "user_email": current_user["email"],
@@ -473,40 +518,35 @@ async def enhance_resume(request: ResumeEnhanceRequest, current_user: dict = Dep
 
 @app.post("/ai/interview-question")
 async def generate_interview_question(request: InterviewQuestion, current_user: dict = Depends(get_current_user)):
-     if not gemini_model:
-         # Provide a default fallback question if Gemini isn't available
-         mock_questions = { "default": "Tell me about a challenging project..." }
-         return {"question": mock_questions["default"]}
-     try:
-        system_prompt = "You are an experienced interviewer..." # Your prompt
-        user_prompt = f"Generate an interview question for a {request.job_role} position..."
+    if not GOOGLE_API_KEY:
+        mock_questions = { "default": "Tell me about a challenging project..." }
+        return {"question": mock_questions["default"]}
+    try:
+        system_prompt = "You are an experienced technical interviewer. Generate one relevant, insightful interview question for the specified job role."
+        user_prompt = f"Generate an interview question for a {request.job_role} position."
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        generation_config = genai.types.GenerationConfig(max_output_tokens=150)
 
-        response = await gemini_model.generate_content_async(full_prompt, generation_config=generation_config)
-        question = response.text
+        question = await generate_gemini_content(full_prompt, max_tokens=150)
 
-     except ValueError as ve:
+    except ValueError as ve:
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
         question = "Could not generate question due to content restrictions. Try a different role."
-     except Exception as e:
+    except Exception as e:
         print(f"Error generating question for user {current_user['email']}: {e}")
         question = f"Error generating question: {str(e)}"
 
-     return {"question": question}
+    return {"question": question}
 
 
 @app.post("/ai/chat")
 async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_current_user)):
-    if not gemini_model:
-         return {"response": "(Mock Response) AI Chat not available without Gemini API key."}
+    if not GOOGLE_API_KEY:
+        return {"response": "(Mock Response) AI Chat not available without Gemini API key."}
     try:
-        system_prompt = "You are an AI assistant for an AI Resume Manager platform..." # Your prompt
+        system_prompt = "You are an AI career assistant for an AI Resume Manager platform. Provide helpful, concise, and accurate advice regarding resumes, job applications, interview prep, and career growth."
         full_prompt = f"{system_prompt}\n\nUser: {message.message}\nAssistant:"
-        generation_config = genai.types.GenerationConfig(max_output_tokens=300)
 
-        response = await gemini_model.generate_content_async(full_prompt, generation_config=generation_config)
-        reply = response.text
+        reply = await generate_gemini_content(full_prompt, max_tokens=400)
 
     except ValueError as ve:
         print(f"Chat response blocked for user {current_user['email']}: {ve}")
@@ -515,7 +555,6 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
         print(f"Error generating chat response for user {current_user['email']}: {e}")
         reply = f"Sorry, I encountered an error: {str(e)}"
 
-    # Save chat interaction
     chat_doc = {
         "user_message": message.message,
         "ai_response": reply,
@@ -529,32 +568,61 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
 # --- Other Routes ---
 @app.get("/templates", summary="Get Resume Templates", tags=["General"])
 async def get_resume_templates():
-    """Returns a list of available resume template examples."""
-    # Ensure you have 4 templates defined here with CORRECT preview image URLs
+    """Returns a list of available resume template examples inspired by Resume.io."""
     templates = [
         {
-            "id": 1, "name": "Professional",
-            "description": "Clean and modern design perfect for corporate roles",
-            "preview": "https://via.placeholder.com/300x200/cccccc/000000?text=Professional", # Replace
-            "category": "Corporate"
+            "id": "stockholm-modern",
+            "name": "Stockholm (Modern)",
+            "description": "Dual-column layout with a dark sidebar, skill tags, and crisp typography",
+            "category": "Modern",
+            "layout": "sidebar-left",
+            "defaultColor": "#1e293b",
+            "preview": "https://images.unsplash.com/photo-1586281380349-632531db7ed4?w=400&auto=format&fit=crop&q=80"
         },
         {
-            "id": 2, "name": "Creative",
-            "description": "Eye-catching design for creative professionals",
-            "preview": "https://via.placeholder.com/300x200/eeeeee/111111?text=Creative", # Replace
-            "category": "Creative"
+            "id": "harvard-professional",
+            "name": "Harvard (Professional)",
+            "description": "Executive top banner with clean horizontal rules, ideal for corporate roles",
+            "category": "Professional",
+            "layout": "header-banner",
+            "defaultColor": "#0f766e",
+            "preview": "https://images.unsplash.com/photo-1586281380117-5a60ae2050cc?w=400&auto=format&fit=crop&q=80"
         },
         {
-            "id": 3, "name": "Technical",
-            "description": "Focused layout highlighting technical skills",
-            "preview": "https://via.placeholder.com/300x200/dddddd/222222?text=Technical", # Replace
-            "category": "Technical"
+            "id": "vibrant-creative",
+            "name": "Vibrant (Creative)",
+            "description": "Stylish headers and rounded skill badge chips for tech & design roles",
+            "category": "Creative",
+            "layout": "creative-vibrant",
+            "defaultColor": "#4f46e5",
+            "preview": "https://images.unsplash.com/photo-1512486130939-2c4f79935e4f?w=400&auto=format&fit=crop&q=80"
         },
         {
-            "id": 4, "name": "Executive",
-            "description": "Sophisticated design for senior-level positions",
-            "preview": "https://via.placeholder.com/300x200/bbbbbb/333333?text=Executive", # Replace
-            "category": "Executive"
+            "id": "dublin-minimalist",
+            "name": "Dublin (Minimalist)",
+            "description": "Ultra-clean single-column layout with subtle dividers and spacious typography",
+            "category": "Minimalist",
+            "layout": "minimalist-single",
+            "defaultColor": "#2563eb",
+            "preview": "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=400&auto=format&fit=crop&q=80"
+        },
+        {
+            "id": "onyx-executive",
+            "name": "Onyx (Executive)",
+            "description": "Premium dark accent header banner with a two-column experience & skills matrix",
+            "category": "Executive",
+            "layout": "onyx-executive",
+            "defaultColor": "#09090b",
+            "preview": "https://images.unsplash.com/photo-1450133064473-71024230f91b?w=400&auto=format&fit=crop&q=80"
+        },
+        {
+            "id": "sydney-compact",
+            "name": "Sydney (Compact)",
+            "description": "High-density balanced 2-column layout optimized for technical experience",
+            "category": "Compact",
+            "layout": "sydney-compact",
+            "defaultColor": "#d97706",
+            "preview": "https://images.unsplash.com/photo-1507679799987-c73779587ccf?w=400&auto=format&fit=crop&q=80"
         }
     ]
     return {"templates": templates}

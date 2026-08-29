@@ -9,7 +9,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json', // Default for most requests
   },
-  timeout: 10000, // Add a reasonable timeout (10 seconds)
+  timeout: 60000, // 60 seconds timeout for processing multiple files / AI operations
 });
 
 // Request interceptor to add token
@@ -95,7 +95,7 @@ export const resumeService = {
     if (!fileAppended) throw new Error("No valid, non-empty files to upload.");
 
     // The request interceptor will remove Content-Type for FormData
-    const response = await api.post('/resumes/upload', formData);
+    const response = await api.post('/resumes/upload', formData, { timeout: 60000 });
     return response.data; // { message, resumes: [...], errors?: [...] }
   },
   getAllResumes: async () => {
