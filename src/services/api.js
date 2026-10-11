@@ -9,7 +9,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json', // Default for most requests
   },
-  timeout: 60000, // 60 seconds timeout for processing multiple files / AI operations
+  timeout: 120000, // AI feedback can take longer than ordinary API requests
 });
 
 // Request interceptor to add token
@@ -152,9 +152,12 @@ export const aiService = {
     const response = await api.post('/ai/enhance-resume', { resume_text: resumeText, target_job: targetJob });
     return response.data; // { suggestions: string }
   },
-  generateInterviewQuestion: async (jobRole) => {
+  generateInterviewQuestion: async (jobRole, previousQuestions = []) => {
     if (!jobRole) throw new Error("Job role required.");
-    const response = await api.post('/ai/interview-question', { job_role: jobRole });
+    const response = await api.post('/ai/interview-question', {
+      job_role: jobRole,
+      previous_questions: previousQuestions,
+    });
     return response.data; // { question: string }
   },
   chatWithAI: async (message, context = null) => {

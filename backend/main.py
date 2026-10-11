@@ -4,7 +4,8 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 from typing import List, Optional
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import PyPDF2 # Added back
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -53,23 +54,34 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 sentence_model = SentenceTransformer('BAAI/bge-base-en-v1.5')
 
 # Google Generative AI Configuration
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-AVAILABLE_GEMINI_MODELS = [
+# Prefer the current Gemini name when both variables exist; keep the older name as a fallback.
+GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+DEFAULT_GEMINI_MODELS = [
+    'gemini-3.1-flash-lite',
+    'gemini-flash-latest',
     'gemini-3.6-flash',
+    'gemini-3.8-flash',
     'gemini-3.5-flash',
     'gemini-2.5-flash-lite',
-    'gemini-flash-latest',
     'gemini-3.7-flash',
     'gemini-pro-latest'
 ]
+configured_gemini_model = os.getenv("GEMINI_MODEL")
+AVAILABLE_GEMINI_MODELS = (
+    [configured_gemini_model] + [model for model in DEFAULT_GEMINI_MODELS if model != configured_gemini_model]
+    if configured_gemini_model
+    else DEFAULT_GEMINI_MODELS
+)
+gemini_client = None
 
 if GOOGLE_API_KEY:
     try:
-        genai.configure(api_key=GOOGLE_API_KEY)
+        gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
         print("Gemini API configured successfully with model list:", AVAILABLE_GEMINI_MODELS)
     except Exception as err:
         print(f"Error configuring Gemini API key: {err}")
 else:
+    gemini_client = None
     print("Warning: GOOGLE_API_KEY not found in .env. AI features relying on Gemini will use mock responses or fail.")
 
 async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
@@ -77,17 +89,54 @@ async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
         raise ValueError("Google Gemini API key not configured")
     
     last_error = None
-    generation_config = genai.types.GenerationConfig(max_output_tokens=max_tokens)
-    
-    for model_name in AVAILABLE_GEMINI_MODELS:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = await model.generate_content_async(prompt, generation_config=generation_config)
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            last_error = e
-            continue
+    thinking_fields = getattr(types.ThinkingConfig, "model_fields", {})
+    thinking_config = None
+    if "thinking_level" in thinking_fields:
+        thinking_config = types.ThinkingConfig(thinking_level="minimal")
+    elif "thinking_budget" in thinking_fields:
+        thinking_config = types.ThinkingConfig(thinking_budget=0)
+    config_options = {"max_output_tokens": max_tokens}
+    if thinking_config is not None:
+        config_options["thinking_config"] = thinking_config
+
+    # Keep the request bounded: a frontend request should not wait through every
+    # unavailable model in the fallback list.
+    for model_name in AVAILABLE_GEMINI_MODELS[:3]:
+        for output_limit in (max_tokens, max_tokens * 2):
+            try:
+                config_options["max_output_tokens"] = output_limit
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        gemini_client.models.generate_content,
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(**config_options),
+                    ),
+                    timeout=15,
+                )
+                answer = (response.text if response else "").strip()
+                candidates = getattr(response, "candidates", None) or []
+                finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+                was_truncated = (
+                    finish_reason == 2
+                    or str(finish_reason).upper().endswith("MAX_TOKENS")
+                )
+                if answer and not was_truncated:
+                    return answer
+                if answer:
+                    last_error = RuntimeError(
+                        f"{model_name} stopped at MAX_TOKENS ({output_limit}); retrying"
+                    )
+            except Exception as e:
+                last_error = e
+                if (
+                    output_limit == max_tokens
+                    and "503" in str(e)
+                    and "UNAVAILABLE" in str(e).upper()
+                ):
+                    await asyncio.sleep(1)
+                    continue
+                break
             
     raise last_error or RuntimeError("Could not generate content with any Gemini model")
 
@@ -114,6 +163,7 @@ class JobDescription(BaseModel):
 
 class InterviewQuestion(BaseModel):
     job_role: str
+    previous_questions: List[str] = Field(default_factory=list)
 
 class ChatMessage(BaseModel):
     message: str
@@ -496,7 +546,10 @@ async def enhance_resume(request: ResumeEnhanceRequest, current_user: dict = Dep
         user_prompt = f"Enhance this resume for the target job: {request.target_job}\n\nResume Text:\n{request.resume_text}"
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
-        suggestions = await generate_gemini_content(full_prompt, max_tokens=600)
+        suggestions = await asyncio.wait_for(
+            generate_gemini_content(full_prompt, max_tokens=800),
+            timeout=45,
+        )
 
     except ValueError as ve:
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
@@ -512,21 +565,40 @@ async def enhance_resume(request: ResumeEnhanceRequest, current_user: dict = Dep
         "user_email": current_user["email"],
         "created_at": datetime.utcnow()
     }
-    await db.enhancements.insert_one(enhancement_doc)
+    try:
+        await asyncio.wait_for(db.enhancements.insert_one(enhancement_doc), timeout=3)
+    except Exception as e:
+        print(f"Unable to save enhancement history: {e}")
     return {"suggestions": suggestions}
 
 
 @app.post("/ai/interview-question")
 async def generate_interview_question(request: InterviewQuestion, current_user: dict = Depends(get_current_user)):
     if not GOOGLE_API_KEY:
-        mock_questions = { "default": "Tell me about a challenging project..." }
-        return {"question": mock_questions["default"]}
+        fallback_questions = [
+            f"Describe a project where you used data or technology to solve a difficult problem as a {request.job_role}.",
+            f"What technical decision are you most proud of in your experience as a {request.job_role}, and what trade-offs did you consider?",
+            f"How would you approach your first 90 days in a {request.job_role} position?",
+        ]
+        used = set(request.previous_questions)
+        return {"question": next((q for q in fallback_questions if q not in used), fallback_questions[0])}
     try:
-        system_prompt = "You are an experienced technical interviewer. Generate one relevant, insightful interview question for the specified job role."
-        user_prompt = f"Generate an interview question for a {request.job_role} position."
+        system_prompt = (
+            "You are an experienced technical interviewer. Write exactly one complete, "
+            "clear interview question tailored to the requested job role. Return only the "
+            "question in plain text. Do not add a heading, evaluation label, explanation, "
+            "markdown, or a partial sentence. For technical roles, ask a specific question "
+            "that gives the candidate enough context to answer meaningfully."
+        )
+        previous = "\n".join(f"- {question}" for question in request.previous_questions[-10:])
+        user_prompt = (
+            f"Write one interview question for a {request.job_role} position.\n"
+            "It must be substantially different from these previously asked questions:\n"
+            f"{previous or '- None'}"
+        )
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
-        question = await generate_gemini_content(full_prompt, max_tokens=150)
+        question = (await generate_gemini_content(full_prompt, max_tokens=1000)).strip()
 
     except ValueError as ve:
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
@@ -543,17 +615,50 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
     if not GOOGLE_API_KEY:
         return {"response": "(Mock Response) AI Chat not available without Gemini API key."}
     try:
-        system_prompt = "You are an AI career assistant for an AI Resume Manager platform. Provide helpful, concise, and accurate advice regarding resumes, job applications, interview prep, and career growth."
+        feedback_mode = message.context == "interview_feedback"
+        if feedback_mode:
+            system_prompt = (
+                "You are an experienced interview coach. Evaluate the candidate's answer completely "
+                "and return a useful, self-contained response in plain text. Use these sections: "
+                "Overall assessment, Strengths, Missing or weak points, and Specific improvements. "
+                "Write exactly 120 to 180 words total, with one or two concise sentences per section. "
+                "Include concrete advice tied to the question and answer. Do not write an essay, "
+                "repeat the prompt, or stop after a fragment."
+            )
+        else:
+            system_prompt = (
+                "You are a helpful AI career assistant. Answer the user's question clearly and "
+                "accurately about resumes, careers, interviews, job applications, or this platform. "
+                "Use concise complete sentences and practical advice."
+            )
         full_prompt = f"{system_prompt}\n\nUser: {message.message}\nAssistant:"
 
-        reply = await generate_gemini_content(full_prompt, max_tokens=400)
+        reply = (await asyncio.wait_for(
+            generate_gemini_content(full_prompt, max_tokens=1000),
+            timeout=45,
+        )).strip()
+        if feedback_mode and (len(reply) < 300 or len(reply) > 1400):
+            retry_prompt = (
+                f"{full_prompt}\n\nYour previous response was too short. Rewrite the evaluation completely "
+                "using all four headings and 120 to 180 words total. Keep each section concise."
+            )
+            reply = (await asyncio.wait_for(
+                generate_gemini_content(retry_prompt, max_tokens=1000),
+                timeout=45,
+            )).strip()
 
+    except asyncio.TimeoutError:
+        print(f"Timed out generating chat feedback for user {current_user['email']}")
+        reply = "Gemini took too long to respond. Please try Get Feedback again."
     except ValueError as ve:
         print(f"Chat response blocked for user {current_user['email']}: {ve}")
         reply = "My response was blocked due to safety settings. Can you ask differently?"
     except Exception as e:
         print(f"Error generating chat response for user {current_user['email']}: {e}")
-        reply = f"Sorry, I encountered an error: {str(e)}"
+        if "503" in str(e) or "UNAVAILABLE" in str(e).upper():
+            reply = "Gemini is temporarily busy. Please wait a few seconds and try Get Feedback again."
+        else:
+            reply = "I could not generate feedback right now. Please try again in a moment."
 
     chat_doc = {
         "user_message": message.message,
@@ -561,7 +666,11 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
         "user_email": current_user["email"],
         "timestamp": datetime.utcnow()
     }
-    await db.chats.insert_one(chat_doc)
+    # Saving history must not block the feedback response when MongoDB is slow or unavailable.
+    try:
+        await asyncio.wait_for(db.chats.insert_one(chat_doc), timeout=3)
+    except Exception as e:
+        print(f"Unable to save chat history: {e}")
     return {"response": reply}
 
 

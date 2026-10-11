@@ -30,12 +30,13 @@ const InterviewTrainer = () => {
     setSessionStarted(true);
     
     try {
-      const result = await aiService.generateInterviewQuestion(jobRole);
+      const result = await aiService.generateInterviewQuestion(jobRole, []);
       setCurrentQuestion(result.question);
       setQuestionHistory([result.question]);
     } catch (error) {
       console.error('Failed to generate question:', error);
-      setCurrentQuestion("Tell me about yourself and why you're interested in this position.");
+      setCurrentQuestion(`Describe a challenging problem you solved in a ${jobRole} project and how you measured the result.`);
+      setQuestionHistory([`Describe a challenging problem you solved in a ${jobRole} project and how you measured the result.`]);
     } finally {
       setQuestionLoading(false);
     }
@@ -47,7 +48,7 @@ const InterviewTrainer = () => {
     setFeedback('');
     
     try {
-      const result = await aiService.generateInterviewQuestion(jobRole);
+      const result = await aiService.generateInterviewQuestion(jobRole, questionHistory);
       setCurrentQuestion(result.question);
       setQuestionHistory(prev => [...prev, result.question]);
     } catch (error) {
@@ -65,7 +66,7 @@ const InterviewTrainer = () => {
     try {
       // Simulate feedback generation (since we're using the chat endpoint)
       const prompt = `Evaluate this interview answer for a ${jobRole} position. Question: "${currentQuestion}" Answer: "${userAnswer}". Provide constructive feedback on content, structure, and suggestions for improvement.`;
-      const result = await aiService.chatWithAI(prompt);
+      const result = await aiService.chatWithAI(prompt, 'interview_feedback');
       setFeedback(result.response);
     } catch (error) {
       console.error('Failed to get feedback:', error);
