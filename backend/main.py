@@ -23,6 +23,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 load_dotenv()
 
@@ -61,76 +62,127 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Initialize AI models
-SENTENCE_MODEL_NAME = os.getenv("SENTENCE_MODEL", "BAAI/bge-base-en-v1.5")
+# Initialize AI models (all-MiniLM-L6-v2 is fast and uses only ~80MB RAM vs 440MB)
+SENTENCE_MODEL_NAME = os.getenv("SENTENCE_MODEL", "all-MiniLM-L6-v2")
+sentence_model = None
 try:
     sentence_model = SentenceTransformer(SENTENCE_MODEL_NAME)
+    print(f"Sentence model '{SENTENCE_MODEL_NAME}' loaded successfully.")
 except Exception as e:
-    print(f"Warning: Failed to load sentence model '{SENTENCE_MODEL_NAME}': {e}. Falling back to 'all-MiniLM-L6-v2'")
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    print(f"Warning: Failed to load sentence model '{SENTENCE_MODEL_NAME}': {e}. Similarity will use TF-IDF fallback.")
 
 # Google Generative AI Configuration
 # Prefer the current Gemini name when both variables exist; keep the older name as a fallback.
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 DEFAULT_GEMINI_MODELS = [
-    'gemini-3.1-flash-lite',
-    'gemini-flash-latest',
-    'gemini-3.6-flash',
-    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
     'gemini-3.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-3.7-flash',
-    'gemini-pro-latest'
+    'gemini-flash-latest',
 ]
 configured_gemini_model = os.getenv("GEMINI_MODEL")
-AVAILABLE_GEMINI_MODELS = (
+CONFIGURED_GEMINI_MODELS = (
     [configured_gemini_model] + [model for model in DEFAULT_GEMINI_MODELS if model != configured_gemini_model]
     if configured_gemini_model
     else DEFAULT_GEMINI_MODELS
 )
+GEMINI_HTTP_TIMEOUT_MS = 60_000
+GEMINI_GENERATION_TIMEOUT_SECONDS = 65
 gemini_client = None
+gemini_available_models: Optional[List[str]] = None
+gemini_model_lock = asyncio.Lock()
 
 if GOOGLE_API_KEY:
     try:
-        gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-        print("Gemini API configured successfully with model list:", AVAILABLE_GEMINI_MODELS)
+        gemini_client = genai.Client(
+            api_key=GOOGLE_API_KEY,
+            http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS),
+        )
+        print("Gemini API configured successfully with preferred models:", CONFIGURED_GEMINI_MODELS)
     except Exception as err:
         print(f"Error configuring Gemini API key: {err}")
 else:
     gemini_client = None
     print("Warning: GOOGLE_API_KEY not found in .env. AI features relying on Gemini will use mock responses or fail.")
 
-async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
-    if not GOOGLE_API_KEY:
-        raise ValueError("Google Gemini API key not configured")
-    
-    last_error = None
-    thinking_fields = getattr(types.ThinkingConfig, "model_fields", {})
-    thinking_config = None
-    if "thinking_level" in thinking_fields:
-        thinking_config = types.ThinkingConfig(thinking_level="minimal")
-    elif "thinking_budget" in thinking_fields:
-        thinking_config = types.ThinkingConfig(thinking_budget=0)
-    config_options = {"max_output_tokens": max_tokens}
-    if thinking_config is not None:
-        config_options["thinking_config"] = thinking_config
+def gemini_model_priority(model_name: str) -> tuple:
+    """Prefer the low-cost text models proven by the API smoke test."""
+    normalized = model_name.lower()
+    preferred_models = {
+        "gemini-3.5-flash-lite": 0,
+        "gemini-3.5-flash": 1,
+        "gemini-flash-latest": 2,
+    }
+    if normalized in preferred_models:
+        return (preferred_models[normalized], normalized)
+    if "flash-lite" in normalized:
+        return (3, normalized)
+    if "flash" in normalized:
+        return (4, normalized)
+    return (5, normalized)
 
-    # Keep the request bounded: a frontend request should not wait through every
-    # unavailable model in the fallback list.
-    for model_name in AVAILABLE_GEMINI_MODELS[:3]:
-        for output_limit in (max_tokens, max_tokens * 2):
+
+async def get_gemini_models() -> List[str]:
+    """Return API-enabled text models, cached after the first successful lookup."""
+    global gemini_available_models
+    if gemini_available_models:
+        return gemini_available_models
+    if gemini_client is None:
+        raise ValueError("Google Gemini client is not configured")
+
+    async with gemini_model_lock:
+        if gemini_available_models:
+            return gemini_available_models
+        try:
+            api_models = await asyncio.wait_for(
+                asyncio.to_thread(lambda: list(gemini_client.models.list())),
+                timeout=GEMINI_GENERATION_TIMEOUT_SECONDS,
+            )
+            available = []
+            for model in api_models:
+                actions = [str(action) for action in (getattr(model, "supported_actions", None) or [])]
+                if any(action.lower().endswith("generatecontent") for action in actions):
+                    name = (getattr(model, "name", "") or "").removeprefix("models/")
+                    # This service generates plain text.  Exclude image and
+                    # preview variants, which commonly have separate quotas
+                    # and are not needed by any endpoint in this backend.
+                    if name and "image" not in name.lower() and "preview" not in name.lower():
+                        available.append(name)
+            if available:
+                preferred = [name for name in CONFIGURED_GEMINI_MODELS if name in available]
+                fallback = sorted((name for name in available if name not in preferred), key=gemini_model_priority)
+                gemini_available_models = preferred + fallback
+                print("Gemini text-generation models available:", gemini_available_models[:5])
+                return gemini_available_models
+            print("Gemini returned no generateContent models; using configured fallback list.")
+        except Exception as err:
+            # A temporary models-list error must not prevent a direct generation request.
+            print(f"Unable to list Gemini models; using configured fallback list: {type(err).__name__}: {err}")
+
+        gemini_available_models = CONFIGURED_GEMINI_MODELS.copy()
+        return gemini_available_models
+
+
+async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
+    if not GOOGLE_API_KEY or gemini_client is None:
+        raise ValueError("Google Gemini API key not configured")
+
+    last_error: Optional[Exception] = None
+    model_names = await get_gemini_models()
+    # Limit each user request to the most suitable text models.  This avoids
+    # retired image/preview models while still surviving a temporary 503.
+    for model_name in model_names[:5]:
+        for attempt in range(2):
             try:
-                config_options["max_output_tokens"] = output_limit
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         gemini_client.models.generate_content,
                         model=model_name,
                         contents=prompt,
-                        config=types.GenerateContentConfig(**config_options),
+                        config=types.GenerateContentConfig(max_output_tokens=max_tokens),
                     ),
-                    timeout=15,
+                    timeout=GEMINI_GENERATION_TIMEOUT_SECONDS,
                 )
-                answer = (response.text if response else "").strip()
+                answer = (getattr(response, "text", None) or "").strip()
                 candidates = getattr(response, "candidates", None) or []
                 finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
                 was_truncated = (
@@ -141,19 +193,23 @@ async def generate_gemini_content(prompt: str, max_tokens: int = 500) -> str:
                     return answer
                 if answer:
                     last_error = RuntimeError(
-                        f"{model_name} stopped at MAX_TOKENS ({output_limit}); retrying"
+                        f"{model_name} stopped at MAX_TOKENS ({max_tokens})"
                     )
+                    break
+                last_error = RuntimeError(f"{model_name} returned an empty response")
             except Exception as e:
                 last_error = e
-                if (
-                    output_limit == max_tokens
-                    and "503" in str(e)
-                    and "UNAVAILABLE" in str(e).upper()
-                ):
+                error_text = str(e)
+                is_service_busy = (
+                    "503" in error_text
+                    or "UNAVAILABLE" in error_text.upper()
+                )
+                if is_service_busy and attempt == 0:
                     await asyncio.sleep(1)
                     continue
+                print(f"Gemini generation failed with {model_name}: {type(e).__name__}: {error_text or repr(e)}")
                 break
-            
+
     raise last_error or RuntimeError("Could not generate content with any Gemini model")
 
 # Pydantic models
@@ -240,21 +296,39 @@ def extract_text_from_docx(file_content: bytes):
         print(f"Error extracting DOCX text: {e}")
         return f"Error extracting DOCX text: {str(e)}"
 
-def calculate_similarity(job_description: str, resume_text: str) -> float:
-    # Basic check for empty inputs
-    if not job_description or not resume_text:
-        return 0.0
+def calculate_batch_similarities(job_description: str, resume_texts: List[str]) -> List[float]:
+    if not job_description or not resume_texts:
+        return [0.0] * len(resume_texts)
+
+    # 1. Try sentence transformer embeddings (vectorized single-pass)
+    if sentence_model is not None:
+        try:
+            # Truncate texts to first 1500 chars to prevent quadratic token slowdown
+            truncated_texts = [(t[:1500] if len(t) > 1500 else t) for t in ([job_description] + resume_texts)]
+            embeddings = sentence_model.encode(truncated_texts, batch_size=32, show_progress_bar=False)
+            job_emb = embeddings[0:1]
+            resume_embs = embeddings[1:]
+            sims = cosine_similarity(job_emb, resume_embs)[0]
+            return [round(max(0.0, min(1.0, float(s))), 4) for s in sims]
+        except Exception as e:
+            print(f"Sentence transformer batch similarity failed: {e}. Falling back to TF-IDF.")
+
+    # 2. Ultra-fast, resilient TF-IDF fallback (executes in milliseconds, 0 RAM overhead)
     try:
-        # Ensure inputs are lists for batch encoding, even if single items
-        job_embedding = sentence_model.encode([job_description])
-        resume_embedding = sentence_model.encode([resume_text])
-        # Calculate cosine similarity
-        similarity = cosine_similarity(job_embedding, resume_embedding)[0][0]
-        # Clamp the value between 0 and 1 (cosine similarity range)
-        return max(0.0, min(1.0, float(similarity)))
+        all_docs = [job_description] + resume_texts
+        tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
+        tfidf_matrix = tfidf.fit_transform(all_docs)
+        job_vec = tfidf_matrix[0:1]
+        resume_vecs = tfidf_matrix[1:]
+        sims = cosine_similarity(job_vec, resume_vecs)[0]
+        return [round(max(0.0, min(1.0, float(s))), 4) for s in sims]
     except Exception as e:
-        print(f"Similarity calculation error: {e}")
-        return 0.0
+        print(f"TF-IDF similarity calculation failed: {e}")
+        return [0.0] * len(resume_texts)
+
+def calculate_similarity(job_description: str, resume_text: str) -> float:
+    scores = calculate_batch_similarities(job_description, [resume_text])
+    return scores[0] if scores else 0.0
 
 # --- Routes ---
 
@@ -524,13 +598,18 @@ async def analyze_job(job_request: JobDescription, current_user: dict = Depends(
          ranked_resumes = []
     else:
         job_text = f"{job_request.title} {job_request.description} {job_request.requirements}"
+        resume_texts = [resume.get("text", "") for resume in resumes_to_analyze]
+
+        # Calculate batch similarity asynchronously in worker thread (never blocks event loop)
+        similarity_scores = await asyncio.to_thread(calculate_batch_similarities, job_text, resume_texts)
+
         ranked_resumes = []
-        for resume in resumes_to_analyze:
-            similarity_score = calculate_similarity(job_text, resume.get("text", "")) # Use .get for safety
+        for idx, resume in enumerate(resumes_to_analyze):
+            score = similarity_scores[idx] if idx < len(similarity_scores) else 0.0
             ranked_resumes.append({
                 "id": str(resume["_id"]),
                 "filename": resume.get("filename", "Unknown Filename"),
-                "similarity_score": similarity_score,
+                "similarity_score": score,
                 "text_preview": (resume.get("text", "")[:300] + "...") if len(resume.get("text", "")) > 300 else resume.get("text", ""),
                 "uploaded_at": resume.get("uploaded_at").isoformat() if resume.get("uploaded_at") else None
             })
@@ -564,15 +643,15 @@ async def enhance_resume(request: ResumeEnhanceRequest, current_user: dict = Dep
 
         suggestions = await asyncio.wait_for(
             generate_gemini_content(full_prompt, max_tokens=800),
-            timeout=45,
+            timeout=75,
         )
 
     except ValueError as ve:
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
         suggestions = "The response was blocked due to safety settings. Please rephrase your request."
     except Exception as e:
-        print(f"Error generating suggestions for user {current_user['email']}: {e}")
-        suggestions = f"Error generating suggestions: {str(e)}"
+        print(f"Error generating suggestions for user {current_user['email']}: {type(e).__name__}: {e}")
+        suggestions = "Gemini is temporarily unavailable. Please try generating suggestions again in a moment."
 
     enhancement_doc = {
         "original_text": request.resume_text,
@@ -620,8 +699,14 @@ async def generate_interview_question(request: InterviewQuestion, current_user: 
         print(f"Content generation blocked for user {current_user['email']}: {ve}")
         question = "Could not generate question due to content restrictions. Try a different role."
     except Exception as e:
-        print(f"Error generating question for user {current_user['email']}: {e}")
-        question = f"Error generating question: {str(e)}"
+        print(f"Error generating question for user {current_user['email']}: {type(e).__name__}: {e}")
+        fallback_questions = [
+            f"Describe a project where you used data or technology to solve a difficult problem as a {request.job_role}.",
+            f"What technical decision are you most proud of in your experience as a {request.job_role}, and what trade-offs did you consider?",
+            f"How would you approach your first 90 days in a {request.job_role} position?",
+        ]
+        used = set(request.previous_questions)
+        question = next((q for q in fallback_questions if q not in used), fallback_questions[0])
 
     return {"question": question}
 
@@ -651,7 +736,7 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
 
         reply = (await asyncio.wait_for(
             generate_gemini_content(full_prompt, max_tokens=1000),
-            timeout=45,
+            timeout=75,
         )).strip()
         if feedback_mode and (len(reply) < 300 or len(reply) > 1400):
             retry_prompt = (
@@ -660,7 +745,7 @@ async def chat_with_ai(message: ChatMessage, current_user: dict = Depends(get_cu
             )
             reply = (await asyncio.wait_for(
                 generate_gemini_content(retry_prompt, max_tokens=1000),
-                timeout=45,
+                timeout=75,
             )).strip()
 
     except asyncio.TimeoutError:
