@@ -30,9 +30,20 @@ app = FastAPI(title="AI Resume Manager API", version="1.0.0")
 security = HTTPBearer()
 
 # CORS configuration
+default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+custom_origins = os.getenv("CORS_ORIGINS", "")
+if custom_origins:
+    default_origins.extend([origin.strip() for origin in custom_origins.split(",") if origin.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=default_origins,
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,7 +62,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Initialize AI models
-sentence_model = SentenceTransformer('BAAI/bge-base-en-v1.5')
+SENTENCE_MODEL_NAME = os.getenv("SENTENCE_MODEL", "BAAI/bge-base-en-v1.5")
+try:
+    sentence_model = SentenceTransformer(SENTENCE_MODEL_NAME)
+except Exception as e:
+    print(f"Warning: Failed to load sentence model '{SENTENCE_MODEL_NAME}': {e}. Falling back to 'all-MiniLM-L6-v2'")
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Google Generative AI Configuration
 # Prefer the current Gemini name when both variables exist; keep the older name as a fallback.
@@ -872,8 +888,8 @@ if __name__ == "__main__":
     # asyncio import is already at the top
 
     port = int(os.getenv("PORT", 8000))
-    # Default to 127.0.0.1 for development security unless overridden
-    host = os.getenv("HOST", "127.0.0.1")
+    # Default to 0.0.0.0 for container and cloud compatibility
+    host = os.getenv("HOST", "0.0.0.0")
     print(f"Starting Uvicorn server on http://{host}:{port}")
     # Set reload based on an environment variable, e.g., APP_ENV=development
     reload_flag = os.getenv("APP_ENV", "production").lower() == "development"
