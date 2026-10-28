@@ -1,7 +1,7 @@
 import axios from 'axios';
 
-// Use environment variable exposed by Vite, otherwise default
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Use environment variable exposed by Vite, otherwise default to deployed Render backend
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://ai-based-resume-screening-and-candidate-24cw.onrender.com';
 
 // Create axios instance
 const api = axios.create({
